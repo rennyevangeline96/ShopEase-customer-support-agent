@@ -24,8 +24,8 @@ Built for the *Social Eagle AI Engineering Program, Multi-Agent Systems Track* (
 | **Resolved ticket**: agent timeline, green badge, sources used | **Escalated ticket**: red badge and escalation reasons |
 | ![Resolved ticket](screenshots/resolved.png) | ![Escalated ticket](screenshots/escalated.png) |
 | **Ticket Log** with filters and CSV / Excel download | **Dashboard** |
-| ![Ticket log](screenshots/log_viewer.png) | ![Dashboard](screenshots/dashboard.png) |
-| **Human Review**: a support person approves an escalated reply | **PII masking**: card number removed before the agents see it |
+| ![Ticket log](screenshots/log_viewer.png) | ![Dashboard](screenshots/Dashboard.png) |
+| **Human Review**: a support person approves an escalated reply |
 | ![Human review](screenshots/Human_in_the_loop.png) | 
 
 
