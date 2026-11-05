@@ -2,8 +2,6 @@
 
 A multi-agent AI support desk built with **AutoGen**, **Python** and **Streamlit**. Four AI agents read a customer complaint, find the answer in the company's own documents, write a grounded reply, and log every ticket. Hard cases are escalated to a human, who can review and approve the reply.
 
-Built for the *Social Eagle AI Engineering Program, Multi-Agent Systems Track* (assignment: **AI Customer Support Automation**).
-
 **Highlights**
 
 - **Four AutoGen agents**, each with one clear job: Query → Knowledge → Resolution → Log
