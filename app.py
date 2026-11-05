@@ -2,8 +2,12 @@
 import asyncio
 import html
 import io
+import json
+import threading
+import time
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from backend import config, ticket_log
@@ -12,6 +16,102 @@ from backend.samples import SAMPLES
 from backend.team import stream_ticket
 
 st.set_page_config(page_title="ShopEase Support Desk", page_icon="🛍️", layout="wide")
+
+
+# ----------------------------------------------------------------------------
+# Backend connection: `streamlit run app.py` also starts the FastAPI backend
+# ----------------------------------------------------------------------------
+def _healthy(url: str) -> bool:
+    try:
+        return requests.get(f"{url}/health", timeout=1.5).ok
+    except requests.RequestException:
+        return False
+
+
+@st.cache_resource(show_spinner="Starting the backend...")
+def start_backend():
+    """Start the FastAPI backend in a background thread, once per Streamlit process.
+    Returns its URL, or None if it could not be reached (the UI then runs the agents
+    in-process, so the app keeps working)."""
+    if config.BACKEND_URL:  # an external backend (for example on a server)
+        return config.BACKEND_URL if _healthy(config.BACKEND_URL) else None
+    url = f"http://127.0.0.1:{config.BACKEND_PORT}"
+    if not _healthy(url):
+        import uvicorn
+        from backend.api import app as api_app
+
+        server = uvicorn.Server(uvicorn.Config(api_app, host="127.0.0.1",
+                                               port=config.BACKEND_PORT, log_level="warning"))
+        threading.Thread(target=server.run, daemon=True).start()
+        for _ in range(60):
+            if _healthy(url):
+                break
+            time.sleep(0.25)
+    return url if _healthy(url) else None
+
+
+BACKEND = start_backend()
+if BACKEND is None:
+    start_backend.clear()  # try again on the next rerun
+
+
+def _http_events(name: str, order: str, complaint: str):
+    payload = {"customer_name": name, "order_id": order, "complaint": complaint}
+    try:
+        with requests.post(f"{BACKEND}/tickets/stream", json=payload, stream=True,
+                           timeout=(5, 300)) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line:
+                    yield json.loads(line.decode("utf-8"))
+    except requests.RequestException as e:
+        yield {"type": "error", "content": f"Backend request failed: {e}"}
+
+
+def _inprocess_events(name: str, order: str, complaint: str):
+    """Fallback when the backend is unreachable: run the agents directly."""
+    loop = asyncio.new_event_loop()
+    agen = stream_ticket(name, order, complaint)
+    try:
+        while True:
+            try:
+                yield loop.run_until_complete(agen.__anext__())
+            except StopAsyncIteration:
+                break
+    finally:
+        loop.run_until_complete(agen.aclose())
+        loop.close()
+
+
+def ticket_events(name: str, order: str, complaint: str):
+    return (_http_events if BACKEND else _inprocess_events)(name, order, complaint)
+
+
+def load_log() -> pd.DataFrame:
+    if BACKEND:
+        try:
+            r = requests.get(f"{BACKEND}/tickets", timeout=10)
+            r.raise_for_status()
+            return pd.DataFrame(r.json(), columns=ticket_log.COLUMNS).fillna("")
+        except requests.RequestException:
+            pass
+    return ticket_log.read_log()
+
+
+def review_ticket(ticket_id: str, reply: str, who: str, row) -> bool:
+    """Human approval. Returns True if it ran through the UserProxyAgent."""
+    if BACKEND:
+        r = requests.post(f"{BACKEND}/tickets/{ticket_id}/review",
+                          json={"response": reply, "reviewed_by": who}, timeout=120)
+        if r.status_code == 409:
+            raise PermissionError(r.json().get("detail", "locked"))
+        r.raise_for_status()
+        return bool(r.json()["via_user_proxy"])
+    approved, via_agent = approve_reply(ticket_id, row["complaint"], row["escalation_reason"],
+                                        row["response"], reply)
+    ticket_log.update_review(ticket_id, approved, who)
+    return via_agent
+
 
 AGENTS = {
     "query_agent": ("🔎", "Customer Query Agent"),
@@ -67,9 +167,9 @@ def render_result(r: dict) -> None:
                f"Guardrail flags: {', '.join(r.get('guardrail_flags') or []) or 'none'}")
 
 
-async def run_live(container, name: str, order: str, complaint: str) -> None:
+def run_live(container, name: str, order: str, complaint: str) -> None:
     st.session_state.events, st.session_state.result = [], None
-    async for ev in stream_ticket(name, order, complaint):
+    for ev in ticket_events(name, order, complaint):
         if ev["type"] == "result":
             st.session_state.result = ev
         else:
@@ -98,6 +198,7 @@ with st.sidebar:
         f"- Vector DB: `FAISS` ({'index built' if kb_ready else 'builds on first ticket'})\n"
         f"- Team: `SelectorGroupChat`\n"
         f"- Stops on: `LOGGED` or {config.MAX_MESSAGES} messages\n"
+        f"- Backend: {('`FastAPI` ✅ [' + BACKEND + '/docs](' + BACKEND + '/docs)') if BACKEND else '⚠️ unreachable, running in-process'}\n"
         f"- API key: {'✅ loaded' if config.OPENAI_API_KEY else '❌ missing (.env)'}"
     )
 
@@ -130,8 +231,8 @@ with tab_new:
         elif not config.OPENAI_API_KEY:
             st.error("OPENAI_API_KEY is missing. Add it to your .env file and restart.")
         else:
-            asyncio.run(run_live(timeline, st.session_state.name, st.session_state.order,
-                                 st.session_state.complaint))
+            run_live(timeline, st.session_state.name, st.session_state.order,
+                     st.session_state.complaint)
     elif st.session_state.get("events"):
         with timeline:
             for ev in st.session_state.events:
@@ -142,7 +243,7 @@ with tab_new:
 # ----------------------------------------------------------------------------
 # Tab 2: ticket log
 # ----------------------------------------------------------------------------
-df = ticket_log.read_log()
+df = load_log()
 with tab_log:
     st.header(f"Ticket log ({len(df)} tickets)")
     if df.empty:
@@ -218,9 +319,7 @@ with tab_human:
                 who = st.text_input("Your name", key=f"who_{tid}")
                 if st.button("✅ Approve & mark handled", key=f"approve_{tid}", disabled=not who.strip()):
                     try:
-                        approved, via_agent = approve_reply(
-                            tid, t["complaint"], t["escalation_reason"], t["response"], reply)
-                        ticket_log.update_review(tid, approved, who.strip())
+                        via_agent = review_ticket(tid, reply, who.strip(), t)
                         st.session_state.review_msg = (
                             f"{tid} approved by {who.strip()} through AutoGen's UserProxyAgent."
                             if via_agent else
@@ -228,6 +327,8 @@ with tab_human:
                         st.rerun()
                     except PermissionError:
                         st.error("Could not save. Close tickets.csv if it is open in Excel and try again.")
+                    except requests.RequestException as e:
+                        st.error(f"Backend request failed: {e}")
         if not done.empty:
             st.subheader("Handled by a human")
             st.dataframe(done[["ticket_id", "category", "escalation_reason", "reviewed_by", "reviewed_at"]]

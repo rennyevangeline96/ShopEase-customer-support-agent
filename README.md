@@ -12,7 +12,8 @@ Built for the *Social Eagle AI Engineering Program, Multi-Agent Systems Track* (
 - **Escalation rules enforced in Python code**, not just in prompts
 - **Guardrails**: sensitive data masked before any LLM call, prompt-injection detection, reply checks before logging
 - **Human-in-the-loop** approval through AutoGen's `UserProxyAgent`
-- **Streamlit UI** with a live agent timeline, Resolved/Escalated badges, ticket log with CSV/Excel download, and a dashboard
+- **Streamlit frontend + FastAPI backend**: the UI streams each agent's output live from the API; ticket log with CSV/Excel download and a dashboard
+- **One command runs everything**: `streamlit run app.py` starts the frontend *and* the backend
 - Replies in the customer's language (Tamil, Hindi and other non-Latin scripts are detected automatically)
 
 ---
@@ -25,61 +26,54 @@ Built for the *Social Eagle AI Engineering Program, Multi-Agent Systems Track* (
 | ![Resolved ticket](screenshots/resolved.png) | ![Escalated ticket](screenshots/escalated.png) |
 | **Ticket Log** with filters and CSV / Excel download | **Dashboard** |
 | ![Ticket log](screenshots/log_viewer.png) | ![Dashboard](screenshots/Dashboard.png) |
-| **Human Review**: a support person approves an escalated reply |
+| **Human Review**: a support person approves an escalated reply 
 | ![Human review](screenshots/Human_in_the_loop.png) | 
-
 
 ---
 
-# System Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
-    A["Customer Complaint<br/>Streamlit UI"] --> B["Input Guardrails<br/>Mask Card, CVV, Aadhaar, Password<br/>Detect Prompt Injection<br/>Detect Language"]
-
-    B --> C
-
-    subgraph AGENTS["AutoGen SelectorGroupChat - Round Robin"]
-        C["Customer Query Agent<br/>Category: Business / Product<br/>Urgency: Low / Medium / High<br/>Generate Summary"]
-
-        D["Knowledge Base Agent<br/>Retrieve Passages<br/>Extract Source File Names"]
-
-        E["Resolution Agent<br/>Reply Using Retrieved Passages Only<br/>Generate Confidence Score"]
-
-        F["Log Agent<br/>log_ticket Tool"]
-
-        C -->|"search_kb tool"| D
-        D --> E
-        E --> F
+    subgraph FE["Frontend: Streamlit (app.py)"]
+        UI["📝 New Ticket · 📒 Ticket Log<br/>📊 Dashboard · 🧑‍💼 Human Review"]
     end
 
-    G[("FAISS Index 1<br/>Company Catalog")]
-    H[("FAISS Index 2<br/>Knowledge Base Documents")]
+    subgraph BE["Backend: FastAPI (backend/api.py)"]
+        API["POST /tickets/stream · GET /tickets<br/>GET /stats · GET /health<br/>POST /tickets/ID/review"]
+        IG["🛡️ Input guardrail<br/>mask card, CVV, OTP, Aadhaar, password<br/>detect prompt injection · detect language"]
 
-    C -->|"lookup_catalog tool"| G
-    D -->|"search_kb tool"| H
+        subgraph TEAM["AutoGen SelectorGroupChat (fixed order via selector_func)"]
+            direction TB
+            Q["🔎 Customer Query Agent<br/>category · business line · product<br/>urgency · sentiment · summary"]
+            K["📚 Knowledge Base Agent<br/>passages + source file names"]
+            R["✍️ Resolution Agent<br/>reply from passages only<br/>+ confidence score"]
+            L["🗂️ Log Agent<br/>log_ticket tool"]
+            Q --> K --> R --> L
+        end
 
-    F --> I["Output Guardrails<br/>Block Unofficial Contacts / Links<br/>Flag Unverified Amounts"]
+        F1[("FAISS index 1<br/>company catalog")]
+        F2[("FAISS index 2<br/>knowledge base docs")]
+        OG["🛡️ Output guardrail<br/>block unofficial contacts/links<br/>flag unverified amounts"]
+        ER{"Escalation rules<br/>(Python code)"}
+        RES["🟢 Resolved"]
+        ESC["🔴 Escalated + reason"]
+        HR["🧑‍💼 UserProxyAgent approval"]
+        CSV[("logs/tickets.csv")]
 
-    I --> J{"Escalation Rules<br/>(Python Code)"}
+        API --> IG --> Q
+        Q -. "lookup_catalog tool" .-> F1
+        K -. "search_kb tool" .-> F2
+        L --> OG --> ER
+        ER -->|"no rule triggered"| RES --> CSV
+        ER -->|"any rule triggered"| ESC --> CSV
+        API -->|"review request"| HR --> CSV
+    end
 
-    J -->|"No Rule Triggered"| K["Resolved"]
-    J -->|"Any Rule Triggered"| L["Escalated<br/>Record Escalation Reason"]
-
-    L --> M["Human Review Tab<br/>UserProxyAgent Approval"]
-
-    K --> N[("tickets.csv")]
-    M --> N
-
-    N --> O["Ticket Log Dashboard<br/>CSV / Excel Download"]
-
-    style AGENTS fill:#f5f5f5,stroke:#888,stroke-width:1px
-    style J fill:#fff3cd,stroke:#d6a800
-    style K fill:#d4edda,stroke:#28a745
-    style L fill:#f8d7da,stroke:#dc3545
+    UI -->|"HTTP: complaint"| API
+    API -->|"live NDJSON events"| UI
+    CSV -->|"GET /tickets"| UI
 ```
-
----
 
 ### The four agents
 
@@ -92,7 +86,7 @@ flowchart TD
 
 ### How a complaint flows
 
-1. The customer submits a complaint in the Streamlit app.
+1. The customer submits a complaint in the Streamlit app, which sends it to the FastAPI backend (`POST /tickets/stream`) and shows each agent's output live as it streams back.
 2. The **input guardrail** masks sensitive data, flags prompt-injection attempts and detects the language.
 3. The **Query Agent** calls `lookup_catalog` to find the business line and product (SaaS, digital product, physical product, marketing service, or account/billing), then outputs category, urgency, sentiment and a summary.
 4. The **Knowledge Base Agent** calls `search_kb` and returns the matching passages and their source files. If nothing is relevant enough it returns `NO_MATCH`.
@@ -102,7 +96,7 @@ flowchart TD
 
 ### Team design: `SelectorGroupChat` with a deterministic selector
 
-The assignment requires the order Query → Knowledge → Resolution → Log. Instead of the default `RoundRobinGroupChat`, this project uses **`SelectorGroupChat`** with a custom `selector_func` that returns the next agent by name:
+The assignment requires the order Query → Knowledge → Resolution → Log. Instead of the default `RoundRobinGroupChat`, this project uses **`SelectorGroupChat`** (a bonus challenge) with a custom `selector_func` that returns the next agent by name:
 
 ```
 user → query_agent → knowledge_agent → resolution_agent → log_agent
@@ -113,6 +107,35 @@ This keeps the order **deterministic**, so a model can never skip or reorder an 
 **Termination:** `TextMentionTermination("LOGGED", sources=["log_agent"]) | MaxMessageTermination(6)`. A normal run uses 5 messages (the task message plus four agents), so the limit of 6 is a safety net, and `LOGGED` is the real stop signal.
 
 **Safety net:** if the Log Agent is ever skipped, `team.py` still triages and writes the log row in code, so no ticket is lost.
+
+---
+
+## Backend API (FastAPI)
+
+The agents run in a FastAPI backend (`backend/api.py`), and the Streamlit app is a thin frontend that talks to it over HTTP.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Status of the API, the API key, both FAISS indexes and the log file |
+| `POST /tickets/stream` | Runs a complaint through the four agents and **streams each agent's output live** as one JSON event per line (NDJSON) |
+| `GET /tickets` | All rows of the ticket log |
+| `GET /stats` | Totals for the dashboard: resolved, escalated, average urgency, tickets per category |
+| `POST /tickets/{ticket_id}/review` | Human approval of an escalated reply (runs the `UserProxyAgent` step) |
+
+Interactive API docs are served at `http://127.0.0.1:8000/docs`, and the Streamlit sidebar links to them. A quick check once the app is running:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+**One command starts both.** When Streamlit starts, `app.py` launches the FastAPI backend in a background thread (once per process) and waits for `/health` to respond. If the backend cannot be reached, for example because the port is busy, the UI falls back to running the agents in-process and says so in the sidebar, so the app keeps working.
+
+**Running the backend separately** (for a server, or if you prefer two processes):
+
+```bash
+uvicorn backend.api:app --port 8000        # terminal 1: backend
+BACKEND_URL=http://localhost:8000 streamlit run app.py   # terminal 2: frontend (PowerShell: $env:BACKEND_URL="http://localhost:8000")
+```
 
 ---
 
@@ -242,9 +265,10 @@ Every complaint becomes one row in `logs/tickets.csv`, which is created automati
 
 ```
 shopease-customer-support/
-├── app.py                      # Streamlit UI (frontend)
+├── app.py                      # Streamlit UI (frontend); also starts the backend
 ├── backend/
 │   ├── config.py               # paths, model names, thresholds (secrets only from .env)
+│   ├── api.py                  # FastAPI backend: /health, /tickets/stream, /tickets, /stats, review
 │   ├── team.py                 # SelectorGroupChat + stream_ticket()
 │   ├── context.py              # per-ticket state and message parsing
 │   ├── escalation.py           # escalation rules (Python)
@@ -308,6 +332,18 @@ streamlit run app.py
 
 The app opens at http://localhost:8501. The first ticket takes a few extra seconds because it builds the two FAISS indexes once. After that the cached indexes are loaded from disk.
 
+This single command starts **both** the Streamlit frontend and the FastAPI backend (see *Backend API* above). The sidebar shows the backend status and a link to its docs.
+
+**Settings in `.env`**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENAI_API_KEY` | none (required) | Your OpenAI key |
+| `CHAT_MODEL` | `gpt-4o-mini` | Model used by the four agents |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | Model used to build the FAISS indexes |
+| `BACKEND_URL` | empty | Leave empty to let `streamlit run app.py` start the backend. Set it to use a backend that is already running |
+| `BACKEND_PORT` | `8000` | Port of the embedded backend |
+
 ## Using the app
 
 - **📝 New Ticket**: pick a sample from the **Test with a sample** dropdown (or type your own complaint, with an optional customer name and order ID), then click **Submit**. Each agent's output appears as it happens, followed by the final reply with its badge and the sources used.
@@ -347,9 +383,22 @@ Run `test_rag` twice: the second run must report that both indexes were loaded f
 
 ---
 
+## Bonus challenges
+
+| Bonus (assignment section 10) | Status |
+|---|---|
+| Replace keyword search with embeddings and a vector store | ✅ **FAISS** with OpenAI `text-embedding-3-small`, two indexes, used as agent tools |
+| `SelectorGroupChat` | ✅ With a deterministic `selector_func` |
+| Human-in-the-loop with `UserProxyAgent` | ✅ Approval runs as a second AutoGen step (see above) |
+| Dashboard in Streamlit | ✅ Dashboard tab |
+| Detect the customer's language and reply in the same language | ✅ Script-based detection (Tamil, Hindi, Telugu, Kannada, Malayalam, Bengali, Arabic, Chinese, Japanese, Korean and others). Romanized text, such as Tamil typed in English letters, is not detected. |
+| Deploy the app | 📄 Deployment guide below (steps written, not tested on a live server) |
+
+---
+
 ## Design decisions
 
-- **One Python app, no separate API server.** AutoGen is a library and Streamlit already runs Python, so `app.py` calls `backend/team.py` directly. This keeps `streamlit run app.py` as the single run command, as the assignment requires, and avoids a second process. The `backend/` folder holds all agent logic, so a REST API such as FastAPI could be added later by wrapping `stream_ticket()`.
+- **Frontend and backend are separate layers, started by one command.** The agents live in a FastAPI backend (`backend/`), and `app.py` is only the UI. The assignment requires the project to run with `streamlit run app.py`, so `app.py` launches the backend in a background thread and talks to it over HTTP. The live agent timeline works because `POST /tickets/stream` sends one JSON event per line as each agent finishes. If the backend cannot start, the UI falls back to calling the agents directly, so the app never breaks.
 - **A fresh team for every ticket.** Each complaint is an independent ticket, not a conversation, so there is no chat memory. This stops context leaking between customers and resets the termination counter. Persistent state lives in the CSV log and the FAISS index.
 - **Rules in code, not only in prompts.** The escalation rules and the guardrails are Python, so a model mistake cannot make a legal threat or a fake phone number slip through.
 - **Structured handoff, exact passages.** The Knowledge Agent's message is the tool's exact output (no LLM rewrite), so the Resolution Agent works from the true passages and the source file names are always correct.
@@ -359,7 +408,7 @@ Run `test_rag` twice: the second run must report that both indexes were loaded f
 
 ## Deployment guide: Docker on a Hostinger VPS
 
-> These are the planned steps. They have not been tested on a live server, and the project does not include Docker files. The app is a single Streamlit process, so one container is enough.
+> These are the planned steps. They have not been tested on a live server, and the project does not include Docker files. The container runs one command, `streamlit run app.py`, which starts both the Streamlit frontend and the FastAPI backend (the backend listens only inside the container), so one container is enough. To split them later, run `uvicorn backend.api:app` as a second service and set `BACKEND_URL` for the frontend.
 
 **1. Add two files to the project root.**
 
@@ -401,14 +450,28 @@ services:
 
 ## Security and cost
 
-API keys live only in .env, which is git-ignored. .env.example contains a placeholder.
-Card numbers, CVV, OTPs, Aadhaar numbers and passwords are masked before reaching any LLM or the log.
-logs/tickets.csv holds customer data and is git-ignored.
+- API keys live only in `.env`, which is git-ignored. `.env.example` contains a placeholder.
+- Card numbers, CVV, OTPs, Aadhaar numbers and passwords are masked **before** reaching any LLM or the log.
+- `logs/tickets.csv` holds customer data and is git-ignored.
+- The embedded backend listens on `127.0.0.1` only, so it is not reachable from other machines. The API has no authentication, so keep it behind the same network boundary (or add a login) before exposing it.
+- Embeddings are built once and cached. Each ticket costs only a few tiny question embeddings plus the chat calls.
+- Set a monthly spend limit in your OpenAI dashboard as a safety net.
+- If a key was ever pushed to GitHub, revoke it from your provider's dashboard and create a new one.
 
 ---
 
+## Assignment checklist
 
+| Requirement | Where |
+|---|---|
+| All four agents built with AutoGen, each with one clear job | `backend/agents/`, wired in `backend/team.py` |
+| The Knowledge Agent answers from documents and shows the file used | `search_kb` returns the source file name; shown in the UI and logged in `kb_sources` |
+| The Resolution Agent does not invent policies | Prompt rules, passages-only input, and the output guardrail |
+| Every ticket saved with the required columns | `backend/ticket_log.py` → `logs/tickets.csv` |
+| Complicated cases marked Escalated with a reason | `backend/escalation.py` |
+| Order Query → Knowledge → Resolution → Log, with clean termination | `backend/team.py`: `LOGGED` or max 6 messages |
+| Runs with one command | `streamlit run app.py` (starts the frontend and the FastAPI backend) |
+| No API keys committed | `.env` is git-ignored, `.env.example` has a placeholder |
+| README with setup, run, architecture and screenshots | This file |
 
-
-
-
+---

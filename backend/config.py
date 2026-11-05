@@ -25,6 +25,11 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.30"))
 KEYWORD_THRESHOLD = 0.40   # only used if the embedding API is unavailable
 
+# Backend API. Leave BACKEND_URL empty and `streamlit run app.py` starts the FastAPI backend
+# itself on BACKEND_PORT. Set BACKEND_URL to use a backend that is already running elsewhere.
+BACKEND_URL = os.getenv("BACKEND_URL", "").strip().rstrip("/")
+BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
+
 # Workflow
 CONFIDENCE_THRESHOLD = 70  # Resolution confidence below this -> escalate
 MAX_MESSAGES = 6           # safety net for the team's termination condition
